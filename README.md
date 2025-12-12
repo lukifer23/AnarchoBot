@@ -1,0 +1,114 @@
+## AnarchoBot (Apple Silicon, Muon)
+
+Minimal SLM training stack for Mac (M3 Pro, 18GB) using PyTorch on MPS and the Muon optimizer. No guardrails, designed for training from scratch with 4K context support, and pipelines for pretrain → SFT → preference tuning.
+
+### Stack
+- Model: GPT-style Transformer, RoPE positions, RMSNorm, SwiGLU MLP, tied embeddings, 4K max context.
+- Optimizer: Muon (orthogonalized momentum) for matrix weights + AdamW for embeddings/bias; cosine LR + warmup.
+- Backend: PyTorch on MPS only (Apple Silicon). No CUDA/CPU fallback; run on a Mac with MPS-enabled PyTorch. Gradient checkpointing to save memory.
+- Data: HF `datasets` streaming; sentencepiece tokenizer trained locally.
+- RL: DPO-style preference tuning (beta-adjustable) on a reference-frozen copy.
+- Monitoring: Comprehensive training metrics, memory monitoring, TensorBoard logging, progress tracking.
+
+### Current Status
+- ✅ Complete training infrastructure with memory monitoring and logging
+- ✅ Successfully tested end-to-end training pipeline (50 steps completed)
+- ✅ Memory usage: ~2.1GB/18GB on M3 Pro (excellent efficiency)
+- ✅ Throughput: ~976 tokens/sec during training
+- 🚧 Full pre-training (2.8B tokens) in progress
+- 🚧 Model has not been fully trained yet (infrastructure ready, training ongoing)
+
+### Setup
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+### Tokenizer (SentencePiece, BPE)
+1) Materialize a corpus sample (Ultra-FineWeb recommended for quality):
+```bash
+python scripts/stream_text_dataset.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --samples 200000 --score-field score --score-min 0.8 --output data/ultrafineweb_sample.txt
+```
+2) Train tokenizer on larger sample (30M+ tokens recommended):
+```bash
+python scripts/train_tokenizer.py --input data/ultrafineweb_full/shard_00000.txt --vocab-size 32000 --model-prefix data/tokenizer
+```
+The `configs/*.yaml` files point at `data/tokenizer.model` by default. Keep `model.vocab_size` in sync with the trained tokenizer size.
+
+### Pre-train (next-token LM)
+Config: `configs/pretrain.yaml` (Ultra-FineWeb streaming, 12x768 model, 4K max context). Run:
+```bash
+PYTHONPATH=src python -m anarchobot.train --config configs/pretrain.yaml
+```
+Notes:
+- Runs on MPS if available; uses fp16 autocast (bf16 on CUDA only).
+- Muon LR defaults to `lr` and Adam LR to `1.5 * lr`. Adjust in config.
+- Checkpoints land in `checkpoints/pretrain/`; resume by setting `checkpoint_path` in the config.
+- Memory monitoring active - training uses ~2.1GB/18GB on M3 Pro.
+- Comprehensive logging to TensorBoard and JSON files.
+- Tested successfully on small scale (50 steps); full training (2.8B tokens) requires improved tokenizer first.
+
+### Supervised Fine-tune (chatty data)
+Config: `configs/sft.yaml` (Ultrachat 200k, `messages` field handled automatically).
+```bash
+python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain/step_2000.pt
+```
+Outputs go to `checkpoints/sft/`.
+
+### Preference Tuning (DPO)
+Config: `configs/rlhf.yaml` (UltraFeedback binarized; expects `prompt/chosen/rejected` fields). Run:
+```bash
+python -m anarchobot.rlhf --config configs/rlhf.yaml \
+  --sft-checkpoint checkpoints/sft/sft_last.pt --beta 0.1
+```
+Produces DPO-tuned checkpoints in `checkpoints/rlhf/`.
+
+### Chat
+```bash
+python scripts/chat.py --config configs/sft.yaml --checkpoint checkpoints/sft/sft_last.pt
+```
+Multi-turn prompt history is kept in plain text; there are no safety filters.
+
+### Muon details
+- Update: orthogonalizes momentum with a Newton–Schulz iteration (`optim.py`). Matrix-like params (ndim ≥ 2, excluding embeds) use Muon; everything else uses AdamW.
+- Works on a single device (no distributed ops). Weight decay is decoupled.
+- Use `lr`/`momentum` to tune Muon; keep `momentum≈0.95` as a stable default.
+
+### Data knobs
+- Pre-train: C4 stream works; for lean runs you can swap in `NeelNanda/pile-uncopyrighted` or `HuggingFaceFW/fineweb` subsets by editing `configs/pretrain.yaml`.
+- SFT: `HuggingFaceH4/ultrachat_200k` is default; OpenAssistant (`OpenAssistant/oasst1`) also works because `messages` lists are flattened.
+- DPO: `HuggingFaceH4/ultrafeedback_binarized` is configured; any dataset with `prompt/chosen/rejected` fields will flow.
+- Alternate pretrain corpus: `EliMC/Ultra-FineWeb` (`content` string field, `en` split). Swap into `data.dataset` and set `data.text_field: content` to leverage its filtered web crawl.
+
+### Data + tokenizer one-liners (Ultra-FineWeb-focused)
+- Stream filtered Ultra-FineWeb (score ≥ 0.8, 200k docs):  
+  `python scripts/stream_text_dataset.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --samples 200000 --score-field score --score-min 0.8 --output data/ultrafineweb_en.txt`
+- Stream until ~2.8B tokens (sharded):  
+  `python scripts/stream_for_token_budget.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --tokenizer data/tokenizer.model --target-tokens 2800000000 --tokens-per-shard 50000000 --score-field score --score-min 0.8 --output-dir data/ultrafineweb_full`
+- Train tokenizer (32k BPE):  
+  `python scripts/train_tokenizer.py --input data/ultrafineweb_en.txt --vocab-size 32000 --model-prefix data/tokenizer`
+- Pretrain (Ultra-FineWeb config):  
+  `python -m anarchobot.train --config configs/pretrain_ultrafineweb.yaml`
+- SFT (Ultrachat):  
+  `python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain_ultrafineweb/step_2000.pt`
+- DPO (UltraFeedback):  
+  `python -m anarchobot.rlhf --config configs/rlhf.yaml --sft-checkpoint checkpoints/sft/sft_last.pt --beta 0.1`
+- Model size + token target:  
+  `python scripts/model_stats.py --config configs/pretrain_ultrafineweb.yaml`
+
+### Performance tips (M3 Pro 18GB)
+- Keep `micro_batch_size=1` and rely on `grad_accum_steps` to hit target tokens/step.
+- Enable gradient checkpointing (already on in configs) to fit 2–4K sequences.
+- Use `data.seq_len=1024–2048` for most steps, then a brief 4K curriculum near the end.
+- MPS has no bf16; leave `precision=float16` for stability. CUDA users can flip to bf16.
+
+### Files of interest
+- `src/anarchobot/model.py` – Transformer with RoPE/RMSNorm/SwiGLU.
+- `src/anarchobot/optim.py` – Muon + AdamW hybrid optimizer.
+- `src/anarchobot/train.py` – pretraining loop (streaming dataloader, cosine LR).
+- `src/anarchobot/finetune.py` – SFT loop.
+- `src/anarchobot/rlhf.py` – DPO preference tuner.
+- `scripts/prepare_corpus.py` / `scripts/train_tokenizer.py` / `scripts/chat.py`.
+
+This repo provides a minimal but robust training stack for Apple Silicon: comprehensive monitoring, memory management, and logging infrastructure for training small language models from scratch. No guardrails or safety filters included - use responsibly.
