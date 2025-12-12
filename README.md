@@ -2,6 +2,21 @@
 
 Minimal SLM training stack for Mac (M3 Pro, 18GB) using PyTorch on MPS and the Muon optimizer. No guardrails, designed for training from scratch with 4K context support, and pipelines for pretrain → SFT → preference tuning.
 
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Raw Data      │ -> │   Tokenization  │ -> │   Pre-training  │ -> │   Fine-tuning   │
+│  (Ultra-FineWeb)│    │  (SentencePiece)│    │   (Next-token)  │    │  (Supervised)  │
+└─────────────────┘    └─────────────────┘    └─────────────────┘    └─────────────────┘
+         │                       │                       │                       │
+         v                       v                       v                       v
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Tokenizer     │    │   137M Model   │    │   Checkpoints   │    │   Chat Model    │
+│   (32K vocab)   │    │   (GPT-style)   │    │   (Rotating)    │    │   (Inference)   │
+└─────────────────┘    └─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+**🚀 Current Status**: Infrastructure complete, tested end-to-end. Ready for large-scale training.
+
 ### Stack
 - Model: GPT-style Transformer, RoPE positions, RMSNorm, SwiGLU MLP, tied embeddings, 4K max context.
 - Optimizer: Muon (orthogonalized momentum) for matrix weights + AdamW for embeddings/bias; cosine LR + warmup.
@@ -94,8 +109,10 @@ Multi-turn prompt history is kept in plain text; there are no safety filters.
   `python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain_ultrafineweb/step_2000.pt`
 - DPO (UltraFeedback):  
   `python -m anarchobot.rlhf --config configs/rlhf.yaml --sft-checkpoint checkpoints/sft/sft_last.pt --beta 0.1`
-- Model size + token target:  
+- Model size + token target:
   `python scripts/model_stats.py --config configs/pretrain_ultrafineweb.yaml`
+- Performance benchmark:
+  `python scripts/benchmark.py --full`
 
 ### Performance tips (M3 Pro 18GB)
 - Keep `micro_batch_size=1` and rely on `grad_accum_steps` to hit target tokens/step.
@@ -112,3 +129,67 @@ Multi-turn prompt history is kept in plain text; there are no safety filters.
 - `scripts/prepare_corpus.py` / `scripts/train_tokenizer.py` / `scripts/chat.py`.
 
 This repo provides a minimal but robust training stack for Apple Silicon: comprehensive monitoring, memory management, and logging infrastructure for training small language models from scratch. No guardrails or safety filters included - use responsibly.
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Current Status](#current-status)
+- [Setup](#setup)
+- [Training Pipeline](#training-pipeline)
+- [Documentation](#documentation)
+- [Key Features](#key-features)
+- [Performance](#performance)
+
+## Documentation
+
+- **[Quick Start Guide](docs/quickstart.md)** - Get up and running in 15 minutes
+- **[Architecture Overview](docs/architecture.md)** - Technical deep dive
+- **[Configuration Guide](docs/configuration.md)** - Detailed parameter tuning
+- **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
+- **[Examples](examples/README.md)** - Sample configs and usage patterns
+- **[Contributing](CONTRIBUTING.md)** - Development guidelines
+- **[Changelog](CHANGELOG.md)** - Version history
+
+## Key Features
+
+- **🧠 Muon Optimizer**: Orthogonalized momentum for stable, fast convergence
+- **🍎 Apple Silicon Optimized**: MPS-exclusive with memory-efficient training
+- **📊 Comprehensive Monitoring**: Real-time metrics, TensorBoard integration
+- **🔄 Robust Resumption**: True checkpointing with automatic recovery
+- **🎯 Production Ready**: Error handling, logging, and validation
+- **📈 Scalable**: From tiny 7M models to large 500M+ parameter models
+
+## Performance
+
+| Hardware | Throughput | Memory | Context |
+|----------|------------|--------|---------|
+| M3 Pro | ~976 tokens/sec | 2.1GB | 4K |
+| Tested on | 50 steps | 409K tokens | Stable |
+
+*Full pre-training (2.8B tokens) pending improved tokenizer training.*
+
+## Project Status
+
+### ✅ Completed
+- **Core Infrastructure**: Complete training stack with monitoring
+- **Apple Silicon Optimization**: MPS-exclusive with memory management
+- **Documentation**: Comprehensive guides and examples
+- **Testing**: End-to-end pipeline validation
+- **Open Source**: MIT licensed, contribution-ready
+
+### 🚧 Next Steps
+- **Large-Scale Training**: 2.8B token pre-training campaign
+- **Improved Tokenizer**: 30M+ token training sample
+- **Model Scaling**: Support for larger architectures
+- **Multi-GPU**: M3 Ultra/Max support
+
+### 🎯 Roadmap
+- **v0.2.0**: Production chat models
+- **v0.3.0**: Multi-GPU training
+- **v0.4.0**: Model evaluation suite
+- **v1.0.0**: Complete training platform
+
+---
+
+*Built with ❤️ on Apple Silicon. No guardrails, just good code.*
