@@ -22,17 +22,17 @@ data:
   streaming: true
 
 train:
-  total_steps: 2000
+  total_steps: 350000         # ~2.87B tokens @ 8192 tokens/step (seq_len 2048, mb=1, accum=4)
   micro_batch_size: 1
   grad_accum_steps: 4
   lr: 3e-4
   min_lr: 3e-5
-  warmup_steps: 200
+  warmup_steps: 2000
   weight_decay: 0.02
   max_grad_norm: 1.0
   log_interval: 25
-  eval_interval: 500
-  ckpt_interval: 500
+  eval_interval: 2000
+  ckpt_interval: 1000
   ckpt_keep: 3
   log_path:
   save_dir: checkpoints/pretrain_ultrafineweb
