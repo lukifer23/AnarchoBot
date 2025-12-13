@@ -56,11 +56,11 @@ def token_chunk_iterator(
         shard_dir: Directory containing shards
         tokenizer: SentencePiece tokenizer (required for text format)
         seq_len: Sequence length
-        format: "mlx" for pre-tokenized, "txt" for raw text
+        format: "mlx" for pre-tokenized pickle, "npz" for pre-tokenized npz, "txt" for raw text
     """
     shards = shard_paths(shard_dir, extension=format)
 
-    if format == "mlx":
+    if format in ("mlx", "npz"):
         # Pre-tokenized format (optimal)
         for x, y in stream_mlx_shards(shards):
             yield x, y

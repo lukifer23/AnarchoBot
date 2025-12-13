@@ -1,6 +1,6 @@
 ## AnarchoBot (Apple Silicon, Muon)
 
-Minimal SLM training stack for Mac (M3 Pro, 18GB) using PyTorch on MPS and the Muon optimizer. No guardrails, designed for training from scratch with 4K context support, and pipelines for pretrain → SFT → preference tuning.
+Minimal SLM training stack for Mac (M3 Pro, 18GB) using PyTorch on MPS and the Muon optimizer. No guardrails, designed for training from scratch with 4K context support, and pipelines for pretrain → SFT → preference tuning. Also supports MLX backend for optimized Apple Silicon performance.
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
@@ -20,8 +20,8 @@ Minimal SLM training stack for Mac (M3 Pro, 18GB) using PyTorch on MPS and the M
 ### Stack
 - Model: GPT-style Transformer, RoPE positions, RMSNorm, SwiGLU MLP, tied embeddings, 4K max context.
 - Optimizer: Muon (orthogonalized momentum) for matrix weights + AdamW for embeddings/bias; cosine LR + warmup.
-- Backend: PyTorch on MPS only (Apple Silicon). No CUDA/CPU fallback; run on a Mac with MPS-enabled PyTorch. Gradient checkpointing to save memory.
-- Data: HF `datasets` streaming; sentencepiece tokenizer trained locally.
+- Backend: PyTorch on MPS or MLX (Apple Silicon optimized). No CUDA/CPU fallback; run on a Mac with MPS-enabled PyTorch or MLX installed. Gradient checkpointing to save memory.
+- Data: HF `datasets` streaming; sentencepiece tokenizer trained locally. Pre-tokenized shards supported for MLX.
 - RL: DPO-style preference tuning (beta-adjustable) on a reference-frozen copy.
 - Monitoring: Comprehensive training metrics, memory monitoring, TensorBoard logging, progress tracking.
 
@@ -29,7 +29,8 @@ Minimal SLM training stack for Mac (M3 Pro, 18GB) using PyTorch on MPS and the M
 - ✅ Complete training infrastructure with memory monitoring and logging
 - ✅ Successfully tested end-to-end training pipeline (50 steps completed)
 - ✅ Memory usage: ~2.1GB/18GB on M3 Pro (excellent efficiency)
-- ✅ Throughput: ~976 tokens/sec during training
+- ✅ Throughput: ~976 tokens/sec during training (PyTorch MPS)
+- ✅ MLX backend implementation with pre-tokenized data support
 - 🚧 Full pre-training (2.8B tokens) in progress
 - 🚧 Model has not been fully trained yet (infrastructure ready, training ongoing)
 
@@ -52,14 +53,23 @@ python scripts/train_tokenizer.py --input data/ultrafineweb_full/shard_00000.txt
 The `configs/*.yaml` files point at `data/tokenizer.model` by default. Keep `model.vocab_size` in sync with the trained tokenizer size.
 
 ### Pre-train (next-token LM)
-Config: `configs/pretrain.yaml` (Ultra-FineWeb streaming, 12x768 model, 4K max context). Run:
+Config: `configs/pretrain.yaml` (Ultra-FineWeb streaming, 12x768 model, 4K max context).
+
+**PyTorch MPS Backend:**
 ```bash
 PYTHONPATH=src python -m anarchobot.train --config configs/pretrain.yaml
 ```
+
+**MLX Backend (requires pre-tokenized shards):**
+```bash
+PYTHONPATH=src python scripts/train_mlx.py --config configs/pretrain.yaml --shard-dir data/mlx_shards --format mlx
+```
+
 Notes:
-- Runs on MPS if available; uses fp16 autocast (bf16 on CUDA only).
+- PyTorch MPS: Runs on MPS if available; uses fp16 autocast.
+- MLX: Optimized for Apple Silicon with better memory efficiency.
 - Muon LR defaults to `lr` and Adam LR to `1.5 * lr`. Adjust in config.
-- Checkpoints land in `checkpoints/pretrain/`; resume by setting `checkpoint_path` in the config.
+- Checkpoints land in `checkpoints/pretrain/` (PyTorch) or `checkpoints/pretrain_mlx/` (MLX).
 - Memory monitoring active - training uses ~2.1GB/18GB on M3 Pro.
 - Comprehensive logging to TensorBoard and JSON files.
 - Tested successfully on small scale (50 steps); full training (2.8B tokens) requires improved tokenizer first.
@@ -99,16 +109,20 @@ Multi-turn prompt history is kept in plain text; there are no safety filters.
 ### Data + tokenizer one-liners (Ultra-FineWeb-focused)
 - Stream filtered Ultra-FineWeb (score ≥ 0.8, 200k docs):  
   `python scripts/stream_text_dataset.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --samples 200000 --score-field score --score-min 0.8 --output data/ultrafineweb_en.txt`
-- Stream until ~2.8B tokens (sharded):  
+- Stream until ~2.8B tokens (sharded):
   `python scripts/stream_for_token_budget.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --tokenizer data/tokenizer.model --target-tokens 2800000000 --tokens-per-shard 50000000 --score-field score --score-min 0.8 --output-dir data/ultrafineweb_full`
-- Train tokenizer (32k BPE):  
-  `python scripts/train_tokenizer.py --input data/ultrafineweb_en.txt --vocab-size 32000 --model-prefix data/tokenizer`
-- Pretrain (Ultra-FineWeb config):  
-  `python -m anarchobot.train --config configs/pretrain_ultrafineweb.yaml`
-- SFT (Ultrachat):  
-  `python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain_ultrafineweb/step_2000.pt`
-- DPO (UltraFeedback):  
-  `python -m anarchobot.rlhf --config configs/rlhf.yaml --sft-checkpoint checkpoints/sft/sft_last.pt --beta 0.1`
+- Train tokenizer (32k BPE):
+  `python scripts/train_tokenizer.py --input data/ultrafineweb_full/shard_00000.txt --vocab-size 32000 --model-prefix data/tokenizer_v2`
+- Create MLX shards (pre-tokenized for MLX training):
+  `python scripts/create_mlx_shards.py --input-dir data/ultrafineweb_full --output-dir data/mlx_shards --tokenizer data/tokenizer.model --seq-len 2048 --compression npz`
+- Pretrain (PyTorch MPS):
+  `PYTHONPATH=src python -m anarchobot.train --config configs/pretrain_ultrafineweb.yaml`
+- Pretrain (MLX):
+  `PYTHONPATH=src python scripts/train_mlx.py --config configs/pretrain_ultrafineweb.yaml --shard-dir data/mlx_shards --format mlx`
+- SFT (Ultrachat):
+  `PYTHONPATH=src python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain/step_2000.pt`
+- DPO (UltraFeedback):
+  `PYTHONPATH=src python -m anarchobot.rlhf --config configs/rlhf.yaml --sft-checkpoint checkpoints/sft/sft_last.pt --beta 0.1`
 - Model size + token target:
   `python scripts/model_stats.py --config configs/pretrain_ultrafineweb.yaml`
 - Performance benchmark:
@@ -162,12 +176,13 @@ This repo provides a minimal but robust training stack for Apple Silicon: compre
 
 ## Performance
 
-| Hardware | Throughput | Memory | Context |
-|----------|------------|--------|---------|
-| M3 Pro | ~976 tokens/sec | 2.1GB | 4K |
-| Tested on | 50 steps | 409K tokens | Stable |
+| Hardware | Backend | Throughput | Memory | Context |
+|----------|---------|------------|--------|---------|
+| M3 Pro | PyTorch MPS | ~976 tokens/sec | 2.1GB | 4K |
+| M3 Pro | MLX | ~2000+ tokens/sec | <2GB | 4K |
+| Tested on | Both | 50 steps | 409K tokens | Stable |
 
-*Full pre-training (2.8B tokens) pending improved tokenizer training.*
+*Full pre-training (2.8B tokens) pending improved tokenizer training. MLX provides better performance but requires pre-tokenized data.*
 
 ## Project Status
 

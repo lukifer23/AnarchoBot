@@ -67,7 +67,7 @@ def create_mlx_shard(
     elif compression == "npz":
         x_arr = np.stack(xs)
         y_arr = np.stack(ys)
-        np.savez_compressed(str(output_shard), x=x_arr, y=y_arr)
+        np.savez(str(output_shard), x=x_arr, y=y_arr)
     else:
         raise ValueError(f"Unknown compression: {compression}")
 

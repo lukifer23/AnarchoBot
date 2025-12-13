@@ -17,7 +17,7 @@ data:
   text_field: content
   seq_len: 2048
   shuffle_buffer: 1000
-  num_workers: 2
+  num_workers: 0
   cache_dir:
   streaming: true
 
@@ -30,7 +30,7 @@ train:
   warmup_steps: 2000
   weight_decay: 0.02
   max_grad_norm: 1.0
-  log_interval: 25
+  log_interval: 1
   eval_interval: 2000
   ckpt_interval: 1000
   ckpt_keep: 3

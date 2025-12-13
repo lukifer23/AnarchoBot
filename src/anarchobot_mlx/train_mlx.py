@@ -101,6 +101,7 @@ def main():
 
     def next_batch():
         """Get next batch - optimized for MLX."""
+        nonlocal data_iter
         xs = []
         ys = []
         for _ in range(batch_size):
@@ -111,13 +112,13 @@ def main():
             except StopIteration:
                 # Restart data iterator when exhausted
                 print("Restarting data iterator...")
-                new_iter = token_chunk_iterator(
+                data_iter = token_chunk_iterator(
                     args.shard_dir,
                     tokenizer if args.format == "txt" else None,
                     seq_len,
                     format=args.format,
                 )
-                x, y = next(new_iter)
+                x, y = next(data_iter)
                 xs.append(x)
                 ys.append(y)
         return mx.stack(xs), mx.stack(ys)
@@ -139,6 +140,7 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
 
     for step in range(total_steps):
+        step_start = time.perf_counter()
         if stop_requested["flag"]:
             emergency = train_cfg.save_dir / "mlx_emergency.npz"
             emergency.parent.mkdir(parents=True, exist_ok=True)
@@ -171,16 +173,19 @@ def main():
         model.update(new_params)
 
         tokens_processed += step_tokens
+        step_elapsed = time.perf_counter() - step_start
         elapsed = time.perf_counter() - wall_start
-        tokens_per_sec = tokens_processed / max(elapsed, 1e-6)
+        tokens_per_sec = step_tokens / max(step_elapsed, 1e-6)
+        tokens_per_sec_avg = tokens_processed / max(elapsed, 1e-6)
         ppl = math.exp(total_loss) if total_loss < 20 else float("inf")
         steps_done = step + 1
         steps_left = max(total_steps - steps_done, 0)
         eta_sec = steps_left * (elapsed / max(steps_done, 1))
         if step % train_cfg.log_interval == 0:
             print(
-                f"[MLX] step {step} loss {total_loss:.4f} ppl {ppl:.2f} tok/s {tokens_per_sec:,.0f} "
-                f"elapsed {elapsed/3600:.2f}h eta {eta_sec/3600:.2f}h"
+                f"[MLX] step {step} loss {total_loss:.4f} ppl {ppl:.2f} "
+                f"tok/s {tokens_per_sec:,.0f} avg_tok/s {tokens_per_sec_avg:,.0f} "
+                f"step {step_elapsed:.2f}s elapsed {elapsed/3600:.2f}h eta {eta_sec/3600:.2f}h"
             )
 
         if step > 0 and step % train_cfg.ckpt_interval == 0:
