@@ -24,6 +24,13 @@ pip install -e .
 python scripts/setup_verification.py
 ```
 
+### Optional: Install MLX for Enhanced Performance
+
+```bash
+# Install MLX for Apple Silicon optimization
+pip install mlx
+```
+
 ## Test Training (10 minutes)
 
 ```bash
@@ -43,9 +50,15 @@ python scripts/train_tokenizer.py \
   --vocab-size 32000 \
   --model-prefix data/tokenizer
 
-# Run a test training session
+# Run a test training session (PyTorch MPS)
 PYTHONPATH=src python -m anarchobot.train \
   --config configs/pretrain.yaml
+
+# Alternative: Test with MLX backend (requires MLX installation)
+PYTHONPATH=src python scripts/train_mlx.py \
+  --config configs/pretrain.yaml \
+  --shard-dir data/ultrafineweb_full \
+  --format txt
 ```
 
 ## Expected Output

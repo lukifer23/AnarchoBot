@@ -90,6 +90,20 @@ GPU Memory (18GB M3 Pro)
 - Trades computation for memory
 - Essential for 4K context lengths
 
+### 4. Backend Options
+
+**PyTorch MPS Backend:**
+- Metal Performance Shaders integration
+- Automatic mixed precision (FP16)
+- Gradient checkpointing for memory efficiency
+- Comprehensive debugging and profiling
+
+**MLX Backend:**
+- Native Apple Silicon optimization
+- Improved memory efficiency
+- Higher throughput potential
+- Pre-tokenized data format for optimal performance
+
 ### 5. Monitoring Infrastructure
 
 ```

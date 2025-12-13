@@ -122,7 +122,7 @@ PYTHONPATH=src python -m anarchobot.train --config examples/minimal_test.yaml
 
 ### 2. Memory Usage Testing
 ```bash
-# Test different configurations
+# Test PyTorch MPS memory usage
 PYTHONPATH=src python -c "
 from anarchobot.memory_monitor import MemoryMonitor
 from anarchobot.model import TransformerLM
@@ -133,7 +133,17 @@ config = ModelConfig(vocab_size=32000)
 model = TransformerLM(config)
 monitor = MemoryMonitor(torch.device('mps'))
 estimate = monitor.estimate_training_memory(model, 1, 2048)
-print(f'Memory estimate: {estimate}')
+print(f'PyTorch memory estimate: {estimate}')
+"
+
+# Test MLX memory usage
+python -c "
+import mlx.core as mx
+from anarchobot_mlx.model_mlx import TransformerLM
+
+model = TransformerLM(vocab_size=32000, n_layers=12, d_model=768, n_heads=12)
+# MLX memory tracking is built-in
+print('MLX model loaded successfully')
 "
 ```
 
@@ -146,7 +156,63 @@ for layers in 6 12 24; do
 done
 ```
 
-### 4. Data Pipeline Testing
+### 4. MLX Backend Examples
+
+#### MLX Model Instantiation
+```python
+import mlx.core as mx
+from anarchobot_mlx.model_mlx import TransformerLM
+
+# Create model
+model = TransformerLM(
+    vocab_size=32000,
+    n_layers=12,
+    d_model=768,
+    n_heads=12,
+    mlp_multiple=4.0,
+    max_seq_len=4096
+)
+
+# Test forward pass
+x = mx.random.uniform(shape=(1, 512), minval=0, maxval=32000, dtype=mx.int32)
+logits, loss = model(x, x)
+print(f"Output shape: {logits.shape}")
+```
+
+#### MLX Data Loading
+```python
+from anarchobot_mlx.data_mlx import token_chunk_iterator
+
+# Load pre-tokenized MLX data
+data_iter = token_chunk_iterator(
+    shard_dir="data/mlx_shards",
+    tokenizer=None,  # Not needed for pre-tokenized data
+    seq_len=2048,
+    format="mlx"
+)
+
+# Get a batch
+x_batch, y_batch = next(data_iter)
+print(f"Batch shapes: x={x_batch.shape}, y={y_batch.shape}")
+```
+
+#### MLX Training Loop
+```python
+import mlx.core as mx
+from anarchobot_mlx.optim_mlx import MuonAdamW
+
+# Setup
+model = TransformerLM(...)
+optimizer = MuonAdamW(lr_muon=3e-4, lr_adam=4.5e-4, weight_decay=0.02)
+
+# Training step
+loss_and_grad = mx.value_and_grad(lambda m, x, y: m(x, y)[1])
+loss, grads = loss_and_grad(model, x_batch, y_batch)
+new_params = optimizer.update(model.trainable_parameters(), grads)
+model.update(new_params)
+```
+
+### 5. Data Pipeline Testing
 ```bash
 # Test data loading performance
 python -c "

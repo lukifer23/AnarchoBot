@@ -227,12 +227,25 @@ train:
 - **Sequence length**: Longer sequences → lower learning rates
 - **Dataset size**: More data → higher learning rates
 
+### Backend-Specific Configuration
+
+#### PyTorch MPS Configuration
+- Automatic mixed precision support
+- CUDA-style gradient scaling
+- Compatible with existing PyTorch debugging tools
+
+#### MLX Configuration
+- Native Apple Silicon optimization
+- Different data loading requirements (pre-tokenized shards)
+- Alternative checkpoint format (.npz files)
+- Higher throughput potential with proper data preparation
+
 ### Hardware-Specific Tuning
 
 **M3 Pro 18GB:**
-- Keep `micro_batch_size: 1`
-- Use `grad_accum_steps` for effective batch size
-- Enable `gradient_checkpointing` for seq_len > 1024
+- **PyTorch MPS**: Keep `micro_batch_size: 1`, use `grad_accum_steps` for effective batch size
+- **MLX**: Can use larger batches, optimized memory usage
+- Enable `gradient_checkpointing` for seq_len > 1024 on both backends
 - Monitor memory with `memory_monitor.py`
 
 **M3 Max/Ultra:**

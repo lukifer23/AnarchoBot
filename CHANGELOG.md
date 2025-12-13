@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TensorBoard integration and detailed logging
 - Robust checkpointing with automatic rotation
 - End-to-end training pipeline validation
+- MLX backend for enhanced Apple Silicon performance
+- Pre-tokenized data pipeline for optimal MLX training
 - Extensive documentation and configuration guides
 - Setup verification and troubleshooting tools
 

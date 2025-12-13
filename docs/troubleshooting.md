@@ -33,6 +33,49 @@ python -c "import torch; torch.mps.current_allocated_memory(); print('MPS memory
 - Check Activity Monitor → GPU tab for utilization
 - Try restarting Python session
 
+#### MLX Backend Issues
+
+##### "MLX not available" during training
+```
+ModuleNotFoundError: No module named 'mlx'
+```
+
+**Solutions:**
+```bash
+# Install MLX
+pip install mlx
+
+# Verify installation
+python -c "import mlx.core as mx; print('MLX available')"
+```
+
+##### MLX data format errors
+```
+ValueError: Unsupported format: txt
+```
+
+**MLX requires pre-tokenized data:**
+```bash
+# Create MLX-compatible shards
+python scripts/create_mlx_shards.py \
+  --input-dir data/ultrafineweb_full \
+  --output-dir data/mlx_shards \
+  --tokenizer data/tokenizer.model \
+  --seq-len 2048 \
+  --compression npz
+
+# Train with MLX
+python scripts/train_mlx.py \
+  --config configs/pretrain.yaml \
+  --shard-dir data/mlx_shards \
+  --format mlx
+```
+
+##### MLX shard creation is slow
+- **Expected**: Each shard takes 1-2 minutes to tokenize
+- **Total time**: ~1-2 hours for 56 shards
+- **Optimization**: Use parallel processing with multiple terminals
+
 ### 2. Memory Issues
 
 #### "MPS out of memory" during training
