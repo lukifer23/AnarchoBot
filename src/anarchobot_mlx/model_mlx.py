@@ -45,6 +45,8 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.rotary = RotaryEmbedding(self.head_dim, max_seq_len, theta=rope_theta)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def __call__(self, x: mx.array, mask: Optional[mx.array]) -> mx.array:
         bsz, seq_len, _ = x.shape
@@ -60,10 +62,10 @@ class SelfAttention(nn.Module):
         att = mx.matmul(q, k.transpose((0, 1, 3, 2))) / math.sqrt(self.head_dim)
         if mask is not None:
             att = att + mask
-        att = mx.softmax(att, axis=-1)
+        att = self.attn_dropout(mx.softmax(att, axis=-1))
         y = mx.matmul(att, v)
         y = y.transpose((0, 2, 1, 3)).reshape((bsz, seq_len, -1))
-        return self.out_proj(y)
+        return self.resid_dropout(self.out_proj(y))
 
 
 class FeedForward(nn.Module):
@@ -74,9 +76,10 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(hidden, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.activation = nn.silu if activation == "silu" else nn.gelu
+        self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.w2(self.activation(self.w1(x)) * self.w3(x))
+        return self.dropout(self.w2(self.activation(self.w1(x)) * self.w3(x)))
 
 
 class TransformerBlock(nn.Module):
