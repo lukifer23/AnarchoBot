@@ -20,12 +20,13 @@ def create_mlx_shard(
     output_shard: Path,
     tokenizer: SentencePieceTokenizer,
     seq_len: int,
-    compression: str = "npz",
+    fmt: str = "npz",
 ):
     """
     Convert a raw text shard to pre-tokenized format.
-    - compression=pickle: appends pickled {"x","y"} records (slow, compatible)
-    - compression=npz: writes one compressed npz with stacked x/y arrays (fast)
+    - fmt=pickle: appends pickled {"x","y"} records (slow, compatible)
+    - fmt=npz: writes one compressed npz with stacked x/y arrays (fast)
+    - fmt=npy: writes uint16 npy pairs (shard_*_x.npy / shard_*_y.npy) for mmap loading
     """
     buffer: List[int] = []
     xs: List[np.ndarray] = []
@@ -59,17 +60,22 @@ def create_mlx_shard(
         return
 
     output_shard.parent.mkdir(parents=True, exist_ok=True)
-    if compression == "pickle":
+    if fmt == "pickle":
         # Use write mode (not append) to create new file per shard
         with output_shard.open("wb") as f_out:
             for x, y in zip(xs, ys):
                 pickle.dump({"x": mx.array(x), "y": mx.array(y)}, f_out)
-    elif compression == "npz":
+    elif fmt == "npz":
         x_arr = np.stack(xs)
         y_arr = np.stack(ys)
         np.savez(str(output_shard), x=x_arr, y=y_arr)
+    elif fmt == "npy":
+        x_arr = np.stack(xs).astype(np.uint16)
+        y_arr = np.stack(ys).astype(np.uint16)
+        np.save(str(output_shard.with_name(output_shard.stem + "_x.npy")), x_arr)
+        np.save(str(output_shard.with_name(output_shard.stem + "_y.npy")), y_arr)
     else:
-        raise ValueError(f"Unknown compression: {compression}")
+        raise ValueError(f"Unknown format: {fmt}")
 
     print(f"Completed {input_shard}: sequences {len(xs)}")
 
@@ -80,7 +86,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for MLX shards")
     parser.add_argument("--tokenizer", type=Path, required=True, help="Tokenizer model file")
     parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
-    parser.add_argument("--compression", choices=["pickle", "npz"], default="npz", help="Compression format")
+    parser.add_argument("--format", choices=["npz", "pickle", "npy"], default="npz", help="Output format: npz/pickle/npy(memmap)")
     parser.add_argument("--max-shards", type=int, help="Limit number of shards to process")
     parser.add_argument("--shard-offset", type=int, default=0, help="Start processing from this shard index")
     args = parser.parse_args()
@@ -100,14 +106,19 @@ def main():
     print(f"Using tokenizer: {args.tokenizer}")
 
     for i, input_shard in enumerate(tqdm(input_shards, desc="Processing shards")):
-        suffix = "npz" if args.compression == "npz" else "mlx"
+        if args.format == "npy":
+            suffix = "npy"
+        elif args.format == "npz":
+            suffix = "npz"
+        else:
+            suffix = "mlx"
         output_shard = args.output_dir / f"shard_{i + args.shard_offset:05d}.{suffix}"
         create_mlx_shard(
             input_shard=input_shard,
             output_shard=output_shard,
             tokenizer=tokenizer,
             seq_len=args.seq_len,
-            compression=args.compression
+            fmt=args.format
         )
 
     print(f"\n✅ Created {len(input_shards)} MLX shards in {args.output_dir}")

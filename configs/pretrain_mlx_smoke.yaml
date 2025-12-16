@@ -1,43 +1,44 @@
 model:
   vocab_size: 32000
-  n_layers: 12
-  d_model: 768
-  n_heads: 12
+  n_layers: 4        # smaller for fast MLX smoke/profiling
+  d_model: 512
+  n_heads: 8
   mlp_multiple: 4.0
   dropout: 0.1
-  max_seq_len: 4096
+  max_seq_len: 2048
   rope_theta: 10000.0
   ffn_activation: silu
   norm_eps: 1e-5
   tie_embeddings: true
 
 data:
+  # memmap shards (uint16) for fast MLX/MPS smoke
+  shard_dir: data/mlx_shards
+  format: npy
   dataset: EliMC/Ultra-FineWeb
   split: en
   text_field: content
-  seq_len: 2048
-  shuffle_buffer: 1000
+  seq_len: 1024
+  shuffle_buffer: 0
   num_workers: 0
   cache_dir:
-  streaming: true
-  shard_dir: data/mlx_shards
-  format: npy  # use memmap shards for both MPS/MLX
+  streaming: false
 
 train:
-  total_steps: 350000         # ~2.87B tokens @ 8192 tokens/step (seq_len 2048, mb=1, accum=4)
+  total_steps: 20
   micro_batch_size: 1
-  grad_accum_steps: 4
+  grad_accum_steps: 2
   lr: 3e-4
   min_lr: 3e-5
-  warmup_steps: 2000
+  warmup_steps: 10
   weight_decay: 0.02
   max_grad_norm: 1.0
   log_interval: 1
-  eval_interval: 2000
-  ckpt_interval: 1000
-  ckpt_keep: 3
+  eval_interval: 1000
+  ckpt_interval: 100
+  ckpt_keep: 2
   log_path:
-  save_dir: checkpoints/pretrain_ultrafineweb
+  save_dir: checkpoints/pretrain_mlx_smoke
   precision: float16
   compile: false
   gradient_checkpointing: true

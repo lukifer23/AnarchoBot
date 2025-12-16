@@ -29,6 +29,8 @@ class DataConfig:
     num_workers: int = 2
     cache_dir: Optional[Path] = None
     streaming: bool = True
+    shard_dir: Optional[Path] = None  # Optional pretokenized shard directory
+    format: str = "stream"  # "stream" (default) or "npy" for memmap shards
 
 
 @dataclass

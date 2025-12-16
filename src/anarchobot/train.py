@@ -10,7 +10,7 @@ from tqdm import tqdm
 import yaml
 
 from .config import DataConfig, ModelConfig, TrainingConfig
-from .data import TokenChunkDataset, collate_batch
+from .data import MemmapShardDataset, TokenChunkDataset, collate_batch
 from .memory_monitor import MemoryMonitor, optimize_batch_size_for_memory
 from .model import TransformerLM
 from .optim import build_muon_adam_optimizer
@@ -41,6 +41,8 @@ def load_configs(path: Path):
     data_dict = dict(cfg["data"])
     if data_dict.get("cache_dir"):
         data_dict["cache_dir"] = Path(data_dict["cache_dir"])
+    if data_dict.get("shard_dir"):
+        data_dict["shard_dir"] = Path(data_dict["shard_dir"])
     data_cfg = DataConfig(**data_dict)
 
     # Load training config
@@ -104,24 +106,34 @@ def main():
         start_step = load_checkpoint(model, optimizer, train_cfg.checkpoint_path)
         print(f"Resumed from step {start_step}")
 
-    dataset = TokenChunkDataset(
-        dataset=data_cfg.dataset,
-        config=data_cfg.config,
-        split=data_cfg.split,
-        text_field=data_cfg.text_field,
-        tokenizer=tokenizer,
-        seq_len=data_cfg.seq_len,
-        shuffle_buffer=data_cfg.shuffle_buffer,
-        streaming=data_cfg.streaming,
-        cache_dir=data_cfg.cache_dir,
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=train_cfg.micro_batch_size,
-        collate_fn=collate_batch,
-        num_workers=data_cfg.num_workers,
-        pin_memory=False,
-    )
+    if data_cfg.shard_dir:
+        dataset = MemmapShardDataset(shard_dir=data_cfg.shard_dir, seq_len=data_cfg.seq_len, fmt=data_cfg.format)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=train_cfg.micro_batch_size,
+            collate_fn=collate_batch,
+            num_workers=0,  # memmap iterable, avoid worker overhead
+            pin_memory=False,
+        )
+    else:
+        dataset = TokenChunkDataset(
+            dataset=data_cfg.dataset,
+            config=data_cfg.config,
+            split=data_cfg.split,
+            text_field=data_cfg.text_field,
+            tokenizer=tokenizer,
+            seq_len=data_cfg.seq_len,
+            shuffle_buffer=data_cfg.shuffle_buffer,
+            streaming=data_cfg.streaming,
+            cache_dir=data_cfg.cache_dir,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=train_cfg.micro_batch_size,
+            collate_fn=collate_batch,
+            num_workers=data_cfg.num_workers,
+            pin_memory=False,
+        )
     data_iter = iter(dataloader)
 
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")

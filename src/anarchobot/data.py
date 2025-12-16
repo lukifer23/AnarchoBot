@@ -1,4 +1,5 @@
-from typing import Iterable, List, Tuple
+from pathlib import Path
+from typing import Iterable, List, Tuple, Optional
 
 import torch
 from datasets import load_dataset
@@ -87,3 +88,34 @@ class TokenChunkDataset(IterableDataset):
 def collate_batch(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
     xs, ys = zip(*batch)
     return torch.stack(xs), torch.stack(ys)
+
+
+class MemmapShardDataset(IterableDataset):
+    """
+    Iterable dataset that streams pre-tokenized shards stored as memory-mapped numpy arrays.
+
+    Expects pairs of files: shard_XXXXX_x.npy and shard_XXXXX_y.npy (dtype uint16 or int32).
+    """
+
+    def __init__(self, shard_dir: str, seq_len: int, fmt: str = "npy"):
+        super().__init__()
+        self.shard_dir = Path(shard_dir)
+        self.seq_len = seq_len
+        self.fmt = fmt
+        if fmt not in ("npy", "mmap"):
+            raise ValueError(f"Unsupported memmap format: {fmt}")
+        self.shards = sorted(self.shard_dir.glob("shard_*_x.npy"))
+        if not self.shards:
+            raise FileNotFoundError(f"No shards found in {self.shard_dir} (expected shard_*_x.npy)")
+
+    def __iter__(self):
+        import numpy as np
+
+        for shard_x in self.shards:
+            shard_y = shard_x.with_name(shard_x.name.replace("_x.npy", "_y.npy"))
+            x_arr = np.load(shard_x, mmap_mode="r")
+            y_arr = np.load(shard_y, mmap_mode="r")
+            if x_arr.shape != y_arr.shape:
+                raise ValueError(f"Shape mismatch between {shard_x} and {shard_y}")
+            for i in range(x_arr.shape[0]):
+                yield torch.from_numpy(x_arr[i].astype("int64")), torch.from_numpy(y_arr[i].astype("int64"))
