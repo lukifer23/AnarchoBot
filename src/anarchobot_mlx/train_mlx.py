@@ -201,6 +201,8 @@ def main():
     if target_dtype is not None:
         model.apply(lambda a: a.astype(target_dtype))
         params = model.trainable_parameters()
+        if opt_state is not None:
+            opt_state = tree_map(lambda a: a.astype(target_dtype) if isinstance(a, mx.array) else a, opt_state)
 
     accum = train_cfg.grad_accum_steps
     total_steps = train_cfg.total_steps
@@ -269,7 +271,6 @@ def main():
         return tree_map(lambda g: g * scale, grads), norm
 
     def loss_fn(xb, yb):
-        # More efficient: compute logits once and handle loss properly
         logits, loss = model(xb, yb)
         if loss is not None:
             return loss
@@ -277,54 +278,137 @@ def main():
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     compiled_loss_and_grad = mx.compile(loss_and_grad_fn)
-    loss_scale = mx.array(1024.0, dtype=mx.float32) if target_dtype == mx.float16 else mx.array(1.0, dtype=mx.float32)
+    loss_scale_value = 1024.0 if target_dtype == mx.float16 else 1.0
+    loss_scale = mx.array(loss_scale_value, dtype=mx.float32)
 
-    # Following nanoGPT_mlx: compiled forward/backward, Python optimizer step
-    def train_step(xb, yb, lr, max_grad_norm, weight_decay):
-        # Temporarily set optimizer learning rate
-        orig_lr = optimizer.learning_rate
-        optimizer.learning_rate = lr
+    # Flatten/unflatten helpers to keep compile input/output count manageable
+    def flatten_tree(tree):
+        leaves = []
+        def _rec(t):
+            if isinstance(t, dict):
+                return ("dict", {k: _rec(v) for k, v in t.items()})
+            if isinstance(t, (list, tuple)):
+                subs = [_rec(v) for v in t]
+                return ("list", type(t), subs)
+            leaves.append(t)
+            return ("leaf", len(leaves) - 1)
+        spec = _rec(tree)
+        return leaves, spec
 
+    def unflatten_tree(leaves, spec):
+        kind = spec[0]
+        if kind == "dict":
+            return {k: unflatten_tree(leaves, v) for k, v in spec[1].items()}
+        if kind == "list":
+            _, typ, subs = spec
+            vals = [unflatten_tree(leaves, s) for s in subs]
+            return typ(vals) if typ is tuple else vals
+        _, idx = spec
+        return leaves[idx]
+
+    def flatten_with_spec(tree, spec):
+        kind = spec[0]
+        if kind == "dict":
+            out = []
+            for k, v in spec[1].items():
+                out.extend(flatten_with_spec(tree[k], v))
+            return out
+        if kind == "list":
+            _, typ, subs = spec
+            seq = list(tree)
+            out = []
+            for i, s in enumerate(subs):
+                out.extend(flatten_with_spec(seq[i], s))
+            return out
+        _, idx = spec
+        return [tree]
+
+    def init_opt_state(p_tree):
+        if isinstance(p_tree, dict):
+            return {k: init_opt_state(p_tree[k]) for k in p_tree}
+        if isinstance(p_tree, (list, tuple)):
+            return type(p_tree)(init_opt_state(p_tree[i]) for i in range(len(p_tree)))
+        return {
+            "exp_avg": mx.zeros_like(p_tree),
+            "exp_avg_sq": mx.zeros_like(p_tree),
+            "step": mx.array(0, dtype=mx.int32),
+        }
+
+    def adamw_update(p_tree, g_tree, s_tree, lr, weight_decay):
+        if isinstance(p_tree, dict):
+            return {k: adamw_update(p_tree[k], g_tree[k], s_tree[k], lr, weight_decay) for k in p_tree}
+        if isinstance(p_tree, (list, tuple)):
+            return type(p_tree)(adamw_update(p_tree[i], g_tree[i], s_tree[i], lr, weight_decay) for i in range(len(p_tree)))
+
+        step_val = s_tree["step"] + 1
+        beta1, beta2 = 0.9, 0.95
+        exp_avg = s_tree["exp_avg"] * beta1 + g_tree * (1 - beta1)
+        exp_avg_sq = s_tree["exp_avg_sq"] * beta2 + mx.square(g_tree) * (1 - beta2)
+        bias_c1 = 1 - beta1 ** step_val
+        bias_c2 = 1 - beta2 ** step_val
+        denom = mx.sqrt(exp_avg_sq / bias_c2) + 1e-8
+        step_update = (exp_avg / bias_c1) / denom
+        new_p = p_tree * (1 - lr * weight_decay) - lr * step_update
+        return {
+            "param": new_p,
+            "exp_avg": exp_avg,
+            "exp_avg_sq": exp_avg_sq,
+            "step": step_val,
+        }
+
+    # Initialize optimizer state and flatten both params and state
+    if opt_state is None:
+        opt_state = init_opt_state(params)
+    params_leaves, params_spec = flatten_tree(params)
+    opt_leaves, opt_spec = flatten_tree(opt_state)
+
+    @mx.compile
+    def compiled_train_step(p_leaves, s_leaves, xb, yb, lr, max_grad_norm, weight_decay):
+        params_tree = unflatten_tree(p_leaves, params_spec)
+        state_tree = unflatten_tree(s_leaves, opt_spec)
+        model.update(params_tree)
         loss, grads = compiled_loss_and_grad(xb, yb)
-        # Loss scaling for fp16 to reduce inf/nan risk and improve matmul utilization
-        loss = loss / loss_scale
-        grads = tree_map(lambda g: g / loss_scale, grads)
+        orig_loss = loss
+        if loss_scale_value != 1.0:
+            loss = loss / loss_scale
+            grads = tree_map(lambda g: g / loss_scale, grads)
         grads, grad_norm = clip_gradients(grads, max_grad_norm)
-        optimizer.update(model, grads)
 
-        # Force evaluation like nanoGPT_mlx
-        mx.eval(loss, grad_norm)
+        def _apply_update(p_t, g_t, s_t):
+            if isinstance(p_t, dict):
+                out_p = {}
+                out_s = {}
+                for k in p_t:
+                    np_, ns_ = _apply_update(p_t[k], g_t[k], s_t[k])
+                    out_p[k] = np_
+                    out_s[k] = ns_
+                return out_p, out_s
+            if isinstance(p_t, (list, tuple)):
+                out_p = []
+                out_s = []
+                for i in range(len(p_t)):
+                    np_, ns_ = _apply_update(p_t[i], g_t[i], s_t[i])
+                    out_p.append(np_)
+                    out_s.append(ns_)
+                return (type(p_t)(out_p) if isinstance(p_t, tuple) else out_p,
+                        type(p_t)(out_s) if isinstance(p_t, tuple) else out_s)
+            # s_t is the dict with exp_avg, exp_avg_sq, step
+            step_val = s_t["step"] + 1
+            beta1, beta2 = 0.9, 0.95
+            exp_avg = s_t["exp_avg"] * beta1 + g_t * (1 - beta1)
+            exp_avg_sq = s_t["exp_avg_sq"] * beta2 + mx.square(g_t) * (1 - beta2)
+            bias_c1 = 1 - beta1 ** step_val
+            bias_c2 = 1 - beta2 ** step_val
+            denom = mx.sqrt(exp_avg_sq / bias_c2) + 1e-8
+            step_update = (exp_avg / bias_c1) / denom
+            new_p = p_t * (1 - lr * weight_decay) - lr * step_update
+            new_s = {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq, "step": step_val}
+            return new_p, new_s
 
-        # Restore original learning rate
-        optimizer.learning_rate = orig_lr
-        return loss, grad_norm
-
-    def eval_tree(tree):
-        res = tree_flatten(tree)
-        if isinstance(res, tuple):
-            leaves = res[0]
-        else:
-            leaves = res
-        if not isinstance(leaves, (list, tuple)):
-            leaves = [leaves]
-        leaves = [leaf for leaf in leaves if leaf is not None]
-        if leaves:
-            mx.eval(*leaves)
-
-    def flatten_arrays(tree, prefix=""):
-        """Flatten nested params/grads to a flat dict of arrays for robust saving."""
-        flat = {}
-        if isinstance(tree, dict):
-            for k, v in tree.items():
-                flat.update(flatten_arrays(v, prefix + k + "."))
-        elif isinstance(tree, (list, tuple)):
-            for i, v in enumerate(tree):
-                flat.update(flatten_arrays(v, prefix + f"{i}."))
-        else:
-            if isinstance(tree, mx.array):
-                name = prefix[:-1] if prefix.endswith(".") else prefix
-                flat[name] = tree
-        return flat
+        new_params_tree, new_state_tree = _apply_update(params_tree, grads, state_tree)
+        new_p_leaves = flatten_with_spec(new_params_tree, params_spec)
+        new_s_leaves = flatten_with_spec(new_state_tree, opt_spec)
+        return orig_loss, grad_norm, new_p_leaves, new_s_leaves
 
     def save_params(path: Path, step: int):
         def safe_numpy_convert(x):
@@ -338,10 +422,12 @@ def main():
                     return np.array(x)
             return x
 
+        current_params = model.trainable_parameters()
+        current_opt = unflatten_tree(opt_leaves, opt_spec)
         payload = {
             "step": step,
-            "params": tree_map(safe_numpy_convert, model.trainable_parameters()),
-            "opt_state": tree_map(safe_numpy_convert, optimizer.state),
+            "params": tree_map(safe_numpy_convert, current_params),
+            "opt_state": tree_map(safe_numpy_convert, current_opt),
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(pickle.dumps(payload))
@@ -363,9 +449,10 @@ def main():
         xb_w = mx.concatenate(warmup_x, axis=0) if len(warmup_x) > 1 else warmup_x[0]
         yb_w = mx.concatenate(warmup_y, axis=0) if len(warmup_y) > 1 else warmup_y[0]
         log_batch_stats(xb_w, yb_w, "warmup")
-        loss_w, grad_norm_w = train_step(
-            xb_w, yb_w, train_cfg.lr, train_cfg.max_grad_norm, train_cfg.weight_decay
+        loss_w, grad_norm_w, params_leaves, opt_leaves = compiled_train_step(
+            params_leaves, opt_leaves, xb_w, yb_w, train_cfg.lr, train_cfg.max_grad_norm, train_cfg.weight_decay
         )
+        model.update(unflatten_tree(params_leaves, params_spec))
     except Exception as e:
         raise RuntimeError(f"Warmup failed: {e}")
     print("Warmup complete, starting training loop...")
@@ -397,9 +484,10 @@ def main():
             lr = cosine_lr(step + 1, train_cfg.warmup_steps, total_steps, train_cfg.lr, train_cfg.min_lr)
 
             profile_start("training_step")
-            loss, grad_norm = train_step(
-                xb_step, yb_step, lr, train_cfg.max_grad_norm, train_cfg.weight_decay
+            loss, grad_norm, params_leaves, opt_leaves = compiled_train_step(
+                params_leaves, opt_leaves, xb_step, yb_step, lr, train_cfg.max_grad_norm, train_cfg.weight_decay
             )
+            model.update(unflatten_tree(params_leaves, params_spec))
             profile_end("training_step")
 
             # Validate training step results - no silent failures
