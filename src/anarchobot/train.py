@@ -13,7 +13,7 @@ from .config import DataConfig, ModelConfig, TrainingConfig
 from .data import MemmapShardDataset, TokenChunkDataset, collate_batch
 from .memory_monitor import MemoryMonitor, optimize_batch_size_for_memory
 from .model import TransformerLM
-from .optim import build_muon_adam_optimizer
+import torch.optim as optim
 from .tokenizer import SentencePieceTokenizer
 from .training_logger import TrainingLogger, TrainingMetrics, TrainingProgressTracker
 from .utils import cosine_lr, get_device, load_checkpoint, rotate_checkpoints, save_checkpoint, set_seed
@@ -93,13 +93,7 @@ def main():
     if train_cfg.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
 
-    optimizer = build_muon_adam_optimizer(
-        model=model,
-        lr_muon=train_cfg.lr,
-        lr_adam=train_cfg.lr * 1.5,
-        weight_decay=train_cfg.weight_decay,
-        momentum=0.95,
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
 
     start_step = 0
     if train_cfg.checkpoint_path and train_cfg.checkpoint_path.exists():

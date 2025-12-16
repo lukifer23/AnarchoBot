@@ -179,8 +179,8 @@ class TransformerLM(nn.Module):
         bsz, seq_len = idx.shape
         assert seq_len <= self.max_seq_len, "sequence length exceeds max_seq_len"
         tok = self.embed(idx)
-        # Explicitly place mask on current default device (MLX arrays lack a .device attr)
-        mask = mx.array(self.causal_mask[:, :, :seq_len, :seq_len])
+        # Use cached causal mask slice; avoid redundant host/device copies
+        mask = self.causal_mask[:, :, :seq_len, :seq_len]
         x = tok
         for block in self.layers:
             x = block(x, mask)
@@ -188,7 +188,8 @@ class TransformerLM(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            logits_flat = logits.reshape((-1, logits.shape[-1]))
+            # Compute loss in float32 to reduce overflow risk when training in reduced precision
+            logits_flat = logits.reshape((-1, logits.shape[-1])).astype(mx.float32)
             targets_flat = targets.reshape((-1,))
             loss = nn.losses.cross_entropy(logits_flat, targets_flat, reduction="mean")
         return logits, loss

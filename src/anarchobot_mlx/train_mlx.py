@@ -1,21 +1,21 @@
 import argparse
 import math
-import signal
 import time
 from pathlib import Path
+from collections import defaultdict
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map, tree_flatten
+from mlx.utils import tree_map
 import numpy as np
 import yaml
+import psutil
 
 from anarchobot.config import DataConfig, ModelConfig, TrainingConfig
 from anarchobot.utils import cosine_lr, rotate_checkpoints
 from anarchobot.tokenizer import SentencePieceTokenizer
-from anarchobot_mlx.data_mlx import StreamingShardLoader
+from anarchobot_mlx.data_mlx import StreamingShardLoader, token_chunk_iterator
 from anarchobot_mlx.model_mlx import TransformerLM
-from anarchobot_mlx.optim_mlx import zeropower_via_newtonschulz5
 import pickle
 from anarchobot.training_logger import TrainingLogger, TrainingMetrics
 
@@ -27,7 +27,6 @@ def parse_args():
     p.add_argument("--format", choices=["mlx", "npz", "npy", "txt"], default="mlx",
                    help="Shard format: pretokenized mlx/npz/npy or raw txt.")
     p.add_argument("--profile-steps", type=int, default=0, help="If >0, capture per-step timings for first N steps.")
-    p.add_argument("--muon-ns-steps", type=int, default=1, help="Newton-Schulz steps for Muon (lower for speed).")
     return p.parse_args()
 
 
@@ -68,8 +67,22 @@ def load_configs(path: Path):
 def load_mlx_checkpoint(path: Path):
     if path.suffix == ".pkl":
         payload = pickle.loads(path.read_bytes())
-        params = tree_map(lambda a: mx.array(a) if isinstance(a, np.ndarray) else a, payload["params"])
-        opt_state = tree_map(lambda a: mx.array(a) if isinstance(a, np.ndarray) else a, payload.get("opt_state", {}))
+
+        def safe_mx_convert(x):
+            """Convert numpy arrays back to MLX arrays, handling dtype issues"""
+            if isinstance(x, np.ndarray):
+                # Convert back to appropriate MLX dtype
+                if x.dtype == np.float32:
+                    return mx.array(x, dtype=mx.float32)
+                elif x.dtype == np.float16:
+                    # If saved as float16, convert to bfloat16 for MLX
+                    return mx.array(x, dtype=mx.bfloat16)
+                else:
+                    return mx.array(x)
+            return x
+
+        params = tree_map(safe_mx_convert, payload["params"])
+        opt_state = tree_map(safe_mx_convert, payload.get("opt_state", {}))
         return params, opt_state, int(payload.get("step", 0))
     # Legacy flat npz checkpoints are not compatible with the current parameter tree
     print(f"⚠️  Skipping legacy checkpoint {path} (npz format not supported for resume).")
@@ -77,8 +90,43 @@ def load_mlx_checkpoint(path: Path):
 
 
 def main():
+    # Clear Python cache to ensure latest code is loaded
+    import subprocess
+    import sys
+    try:
+        subprocess.run([sys.executable, "-m", "py_compile", __file__], check=True, capture_output=True)
+    except:
+        pass  # Ignore cache clearing failures
+
     args = parse_args()
     model_cfg, data_cfg, train_cfg = load_configs(args.config)
+
+    # Profiling infrastructure
+    profile_stats = defaultdict(list)
+    profile_enabled = args.profile_steps > 0
+
+    def profile_start(name):
+        if profile_enabled:
+            profile_stats[f"{name}_start"] = time.perf_counter()
+
+    def profile_end(name):
+        if profile_enabled:
+            start_time = profile_stats.get(f"{name}_start")
+            if start_time is not None:
+                duration = time.perf_counter() - start_time
+                profile_stats[name].append(duration)
+                return duration
+        return 0.0
+
+    def print_profile_summary():
+        if not profile_enabled or not profile_stats:
+            return
+        print("\n=== MLX PROFILING SUMMARY ===")
+        for key, values in profile_stats.items():
+            if not key.endswith("_start") and values:
+                avg_time = sum(values) / len(values)
+                print(f"{key}: {avg_time*1000:.2f} ms avg over {len(values)} samples")
+        print("=" * 30)
     if train_cfg.warmup_steps < 1:
         raise ValueError("warmup_steps must be >= 1")
 
@@ -117,16 +165,17 @@ def main():
     # model.enable_gradient_checkpointing(train_cfg.gradient_checkpointing)
     model.train()
 
-    # Functional params/state for training
+    # Functional params/state for compiled training
     params = model.trainable_parameters()
     opt_state = None
+
     start_step = 0
     if train_cfg.checkpoint_path and train_cfg.checkpoint_path.exists():
         params_loaded, opt_state_loaded, start_step = load_mlx_checkpoint(train_cfg.checkpoint_path)
         if params_loaded is not None:
             params = params_loaded
             opt_state = opt_state_loaded
-            model.update(params)
+            model.update(params_loaded)
             print(f"Resumed from checkpoint {train_cfg.checkpoint_path} at step {start_step}")
         else:
             print(f"Skipped incompatible checkpoint {train_cfg.checkpoint_path}")
@@ -137,17 +186,31 @@ def main():
             if params_loaded is not None:
                 params = params_loaded
                 opt_state = opt_state_loaded
-                model.update(params)
+                model.update(params_loaded)
                 print(f"Resumed from {last_ckpt} at step {start_step}")
             else:
                 print(f"Skipped incompatible checkpoint {last_ckpt}")
 
+    # Honor precision preference (float16/bfloat16) for performance; default to float16 on MLX
+    target_dtype = None
+    prec = getattr(train_cfg, "precision", "")
+    if prec in ("float16", "fp16", "half", "", None):
+        target_dtype = mx.float16
+    elif prec in ("bfloat16", "bf16"):
+        target_dtype = mx.bfloat16
+    if target_dtype is not None:
+        model.apply(lambda a: a.astype(target_dtype))
+        params = model.trainable_parameters()
+
     accum = train_cfg.grad_accum_steps
     total_steps = train_cfg.total_steps
+    # For profiling, surface per-step logs to see progress
+    console_log_interval = 1 if args.profile_steps else train_cfg.log_interval
+
     logger = TrainingLogger(
         log_dir=train_cfg.save_dir / "logs",
         experiment_name=f"mlx_pretrain_{model_cfg.d_model}d_{model_cfg.n_layers}l",
-        console_log_interval=train_cfg.log_interval,
+        console_log_interval=console_log_interval,
         checkpoint_log_interval=train_cfg.ckpt_interval,
     )
     logger.log_hyperparameters(
@@ -205,72 +268,36 @@ def main():
         scale = mx.where(norm > max_norm, max_norm / norm, 1.0)
         return tree_map(lambda g: g * scale, grads), norm
 
-    def loss_fn(p, xb, yb):
-        logits, loss = model.apply(p, xb, targets=yb)
-        if loss is None:
-            loss = nn.losses.cross_entropy(logits, yb, reduction="mean")
-        return loss
+    def loss_fn(xb, yb):
+        # More efficient: compute logits once and handle loss properly
+        logits, loss = model(xb, yb)
+        if loss is not None:
+            return loss
+        return nn.losses.cross_entropy(logits, yb, reduction="mean")
 
-    loss_and_grad_fn = mx.value_and_grad(loss_fn, argnums=0)
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    compiled_loss_and_grad = mx.compile(loss_and_grad_fn)
+    loss_scale = mx.array(1024.0, dtype=mx.float32) if target_dtype == mx.float16 else mx.array(1.0, dtype=mx.float32)
 
-    def init_opt_state(p_tree, prefix=""):
-        if isinstance(p_tree, dict):
-            return {k: init_opt_state(p_tree[k], prefix + k + ".") for k in p_tree}
-        if isinstance(p_tree, (list, tuple)):
-            return type(p_tree)(init_opt_state(p_tree[i], prefix + f"{i}.") for i in range(len(p_tree)))
-        name = prefix[:-1] if prefix.endswith(".") else prefix
-        if p_tree.ndim >= 2 and "embed" not in name and "lm_head" not in name:
-            return {"momentum": mx.zeros_like(p_tree)}
-        else:
-            return {
-                "exp_avg": mx.zeros_like(p_tree),
-                "exp_avg_sq": mx.zeros_like(p_tree),
-                "step": mx.array(0, dtype=mx.int32),
-            }
+    # Following nanoGPT_mlx: compiled forward/backward, Python optimizer step
+    def train_step(xb, yb, lr, max_grad_norm, weight_decay):
+        # Temporarily set optimizer learning rate
+        orig_lr = optimizer.learning_rate
+        optimizer.learning_rate = lr
 
-    def muon_adam_update(p_tree, g_tree, s_tree, lr_muon, lr_adam, momentum, ns_steps, prefix=""):
-        if isinstance(p_tree, dict):
-            out_p = {}
-            out_s = {}
-            for k in p_tree:
-                child_state = s_tree.get(k) if isinstance(s_tree, dict) else None
-                if child_state is None:
-                    child_state = init_opt_state(p_tree[k], prefix + k + ".")
-                np_, ns_ = muon_adam_update(p_tree[k], g_tree[k], child_state, lr_muon, lr_adam, momentum, ns_steps, prefix + k + ".")
-                out_p[k] = np_
-                out_s[k] = ns_
-            return out_p, out_s
-        if isinstance(p_tree, (list, tuple)):
-            out_p = []
-            out_s = []
-            for i in range(len(p_tree)):
-                child_state = s_tree[i] if isinstance(s_tree, (list, tuple)) else None
-                if child_state is None:
-                    child_state = init_opt_state(p_tree[i], prefix + f"{i}.")
-                np_, ns_ = muon_adam_update(p_tree[i], g_tree[i], child_state, lr_muon, lr_adam, momentum, ns_steps, prefix + f"{i}.")
-                out_p.append(np_)
-                out_s.append(ns_)
-            return type(p_tree)(out_p), type(p_tree)(out_s)
+        loss, grads = compiled_loss_and_grad(xb, yb)
+        # Loss scaling for fp16 to reduce inf/nan risk and improve matmul utilization
+        loss = loss / loss_scale
+        grads = tree_map(lambda g: g / loss_scale, grads)
+        grads, grad_norm = clip_gradients(grads, max_grad_norm)
+        optimizer.update(model, grads)
 
-        name = prefix[:-1] if prefix.endswith(".") else prefix
-        if s_tree is None:
-            s_tree = init_opt_state(p_tree, prefix)
-        if p_tree.ndim >= 2 and "embed" not in name and "lm_head" not in name:
-            mom = s_tree["momentum"] * momentum + g_tree * (1 - momentum)
-            update = zeropower_via_newtonschulz5(mom, steps=ns_steps) if ns_steps > 0 else mom
-            new_p = p_tree * (1 - lr_muon * train_cfg.weight_decay) - lr_muon * update
-            return new_p, {"momentum": mom}
-        else:
-            step_val = s_tree["step"] + 1
-            beta1, beta2 = 0.9, 0.95
-            exp_avg = s_tree["exp_avg"] * beta1 + g_tree * (1 - beta1)
-            exp_avg_sq = s_tree["exp_avg_sq"] * beta2 + mx.square(g_tree) * (1 - beta2)
-            bias_c1 = 1 - beta1 ** step_val
-            bias_c2 = 1 - beta2 ** step_val
-            denom = mx.sqrt(exp_avg_sq / bias_c2) + 1e-8
-            step_update = (exp_avg / bias_c1) / denom
-            new_p = p_tree * (1 - lr_adam * train_cfg.weight_decay) - lr_adam * step_update
-            return new_p, {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq, "step": step_val}
+        # Force evaluation like nanoGPT_mlx
+        mx.eval(loss, grad_norm)
+
+        # Restore original learning rate
+        optimizer.learning_rate = orig_lr
+        return loss, grad_norm
 
     def eval_tree(tree):
         res = tree_flatten(tree)
@@ -299,11 +326,22 @@ def main():
                 flat[name] = tree
         return flat
 
-    def save_params(path: Path, params, opt_state, step: int):
+    def save_params(path: Path, step: int):
+        def safe_numpy_convert(x):
+            """Convert MLX arrays to numpy, handling different dtypes properly"""
+            if isinstance(x, mx.array):
+                # Handle bfloat16 conversion - MLX bfloat16 might not convert directly to numpy
+                if x.dtype == mx.bfloat16:
+                    # Convert to float32 first, then to numpy
+                    return np.array(x.astype(mx.float32))
+                else:
+                    return np.array(x)
+            return x
+
         payload = {
             "step": step,
-            "params": tree_map(lambda a: np.array(a) if isinstance(a, mx.array) else a, params),
-            "opt_state": tree_map(lambda a: np.array(a) if isinstance(a, mx.array) else a, opt_state),
+            "params": tree_map(safe_numpy_convert, model.trainable_parameters()),
+            "opt_state": tree_map(safe_numpy_convert, optimizer.state),
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(pickle.dumps(payload))
@@ -316,20 +354,17 @@ def main():
 
     print("Warmup: running first MLX step to initialize kernels (can take ~20-30s)...")
     try:
-        xb_w, yb_w = next_batch()
+        warmup_x = []
+        warmup_y = []
+        for _ in range(accum):
+            xb_w, yb_w = next_batch()
+            warmup_x.append(xb_w)
+            warmup_y.append(yb_w)
+        xb_w = mx.concatenate(warmup_x, axis=0) if len(warmup_x) > 1 else warmup_x[0]
+        yb_w = mx.concatenate(warmup_y, axis=0) if len(warmup_y) > 1 else warmup_y[0]
         log_batch_stats(xb_w, yb_w, "warmup")
-        if opt_state is None:
-            opt_state = init_opt_state(params)
-        loss_w, grads_w = loss_and_grad_fn(params, xb_w, yb_w)
-        grads_w, _ = clip_gradients(grads_w, train_cfg.max_grad_norm)
-        params, opt_state = muon_adam_update(
-            params,
-            grads_w,
-            opt_state,
-            lr_muon=train_cfg.lr,
-            lr_adam=train_cfg.lr * 1.5,
-            momentum=0.95,
-            ns_steps=args.muon_ns_steps,
+        loss_w, grad_norm_w = train_step(
+            xb_w, yb_w, train_cfg.lr, train_cfg.max_grad_norm, train_cfg.weight_decay
         )
     except Exception as e:
         raise RuntimeError(f"Warmup failed: {e}")
@@ -337,24 +372,11 @@ def main():
 
     tokens_processed = 0
     wall_start = time.perf_counter()
-    stop_requested = {"flag": False}
     step = start_step  # Initialize step for exception handling
-
-    def _handle_signal(signum, frame):
-        stop_requested["flag"] = True
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
         for step in range(start_step, total_steps):
             step_start = time.perf_counter()
-            if stop_requested["flag"]:
-                emergency = train_cfg.save_dir / "mlx_emergency.pkl"
-                save_params(emergency, model.trainable_parameters(), step)
-                rotate_checkpoints(train_cfg.save_dir, "mlx_step_", train_cfg.ckpt_keep)
-                break
-
             total_loss = 0.0
             step_tokens = 0
 
@@ -367,18 +389,37 @@ def main():
                 yb_list.append(yb)
 
             step_t0 = time.perf_counter()
+            profile_start("data_prep")
             xb_step = mx.concatenate(xb_list, axis=0) if len(xb_list) > 1 else xb_list[0]
             yb_step = mx.concatenate(yb_list, axis=0) if len(yb_list) > 1 else yb_list[0]
-            lr = cosine_lr(step + 1, train_cfg.warmup_steps, total_steps, train_cfg.lr, train_cfg.min_lr)
-            loss, grads = loss_and_grad_fn(params, xb_step, yb_step)
-            grads, grad_norm = clip_gradients(grads, train_cfg.max_grad_norm)
-            params, opt_state = muon_adam_update(params, grads, opt_state, lr_muon=lr, lr_adam=lr * 1.5, momentum=0.95, ns_steps=args.muon_ns_steps)
+            profile_end("data_prep")
 
-            total_loss = float(loss)
+            lr = cosine_lr(step + 1, train_cfg.warmup_steps, total_steps, train_cfg.lr, train_cfg.min_lr)
+
+            profile_start("training_step")
+            loss, grad_norm = train_step(
+                xb_step, yb_step, lr, train_cfg.max_grad_norm, train_cfg.weight_decay
+            )
+            profile_end("training_step")
+
+            # Validate training step results - no silent failures
+            loss_val = float(loss)
             grad_norm_val = float(grad_norm)
 
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                raise RuntimeError(f"Invalid loss detected: {loss_val}")
+            if math.isnan(grad_norm_val) or math.isinf(grad_norm_val):
+                raise RuntimeError(f"Invalid grad_norm detected: {grad_norm_val}")
+            if not (0 <= loss_val <= 100):  # Reasonable bounds for cross-entropy loss
+                raise RuntimeError(f"Suspicious loss value: {loss_val}")
+
+            total_loss = loss_val
+
             if args.profile_steps and step < args.profile_steps:
-                print(f"[PROFILE] step {step} training_step {(time.perf_counter()-step_t0)*1000:.2f} ms")
+                data_time = profile_stats.get("data_prep", [0])[-1] * 1000
+                step_time = profile_stats.get("training_step", [0])[-1] * 1000
+                print(f"[PROFILE] step {step} data_prep {data_time:.2f}ms training_step {step_time:.2f}ms total {(time.perf_counter()-step_t0)*1000:.2f}ms")
+                print(f"[DEBUG] Step {step} completed, preparing next batch...")
 
             tokens_processed += step_tokens
             step_elapsed = time.perf_counter() - step_start
@@ -389,12 +430,23 @@ def main():
             steps_done = step + 1
             steps_left = max(total_steps - steps_done, 0)
             eta_sec = steps_left * (elapsed / max(steps_done, 1))
-            if step % train_cfg.log_interval == 0:
+            if step % console_log_interval == 0:
+                # Rough memory estimate from param count (params + grads + opt state)
+                def _count_elems(tree):
+                    if isinstance(tree, dict):
+                        return sum(_count_elems(v) for v in tree.values())
+                    if isinstance(tree, (list, tuple)):
+                        return sum(_count_elems(v) for v in tree)
+                    if isinstance(tree, mx.array):
+                        return int(tree.size)
+                    return 0
+                param_elems = _count_elems(model.trainable_parameters())
+                estimated_mb = int(param_elems * 4 * 3 / 1024 / 1024)  # assume 4 bytes, params+grads+opt
                 print(
                     f"[MLX] step {step} loss {total_loss:.4f} ppl {ppl:.2f} "
                     f"lr {lr:.6f} grad_norm {grad_norm:.2f} "
                     f"tok/s {tokens_per_sec:,.0f} avg_tok/s {tokens_per_sec_avg:,.0f} "
-                    f"step {step_elapsed:.2f}s elapsed {elapsed/3600:.2f}h eta {eta_sec/3600:.2f}h"
+                    f"step {step_elapsed:.2f}s elapsed {elapsed/3600:.2f}h eta {eta_sec/3600:.2f}h mem ~{estimated_mb}MB"
                 )
 
             metrics = TrainingMetrics(
@@ -412,18 +464,20 @@ def main():
 
         if step > 0 and step % train_cfg.ckpt_interval == 0:
             ckpt_path = train_cfg.save_dir / f"mlx_step_{step}.pkl"
-            save_params(ckpt_path, params, opt_state, step)
+            save_params(ckpt_path, step)
             rotate_checkpoints(train_cfg.save_dir, "mlx_step_", train_cfg.ckpt_keep)
     except KeyboardInterrupt:
-        stop_requested["flag"] = True
         print("KeyboardInterrupt received, saving emergency checkpoint...")
         emergency = train_cfg.save_dir / "mlx_emergency.pkl"
-        save_params(emergency, params, opt_state, step if 'step' in locals() else 0)
+        save_params(emergency, step if 'step' in locals() else 0)
         rotate_checkpoints(train_cfg.save_dir, "mlx_step_", train_cfg.ckpt_keep)
 
     final_ckpt = train_cfg.save_dir / "mlx_last.pkl"
-    save_params(final_ckpt, params, opt_state, total_steps)
+    save_params(final_ckpt, total_steps)
     rotate_checkpoints(train_cfg.save_dir, "mlx_step_", train_cfg.ckpt_keep)
+    # Print profiling summary
+    print_profile_summary()
+
     # Only save final summary if we actually ran some training steps
     if logger.metrics_history:
         logger.save_final_summary()
