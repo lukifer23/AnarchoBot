@@ -39,7 +39,7 @@ train:
   ckpt_keep: 2
   log_path:
   save_dir: checkpoints/pretrain_mlx_smoke
-  precision: float16
+  precision: float32
   compile: false
   gradient_checkpointing: true
   tokenizer_path: data/tokenizer.model

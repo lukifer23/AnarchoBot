@@ -53,23 +53,23 @@ python scripts/train_tokenizer.py --input data/ultrafineweb_full/shard_00000.txt
 The `configs/*.yaml` files point at `data/tokenizer.model` by default. Keep `model.vocab_size` in sync with the trained tokenizer size.
 
 ### Pre-train (next-token LM)
-Config: `configs/pretrain.yaml` (Ultra-FineWeb streaming, 12x768 model, 4K max context).
+Config: `configs/pretrain_unified.yaml` (canonical 12x768, 4K context, memmap shards). Use `configs/pretrain_mlx_smoke.yaml` for a fast MLX smoke profile.
 
 **PyTorch MPS Backend:**
 ```bash
-PYTHONPATH=src python -m anarchobot.train --config configs/pretrain.yaml
+PYTHONPATH=src python -m anarchobot.train --config configs/pretrain_unified.yaml
 ```
 
 **MLX Backend (requires pre-tokenized shards):**
 ```bash
-PYTHONPATH=src python scripts/train_mlx.py --config configs/pretrain.yaml --shard-dir data/mlx_shards --format mlx
+PYTHONPATH=src python scripts/train_mlx.py --config configs/pretrain_unified.yaml --shard-dir data/pretrain_shards --format npy
 ```
 
 Notes:
 - PyTorch MPS: Runs on MPS if available; uses fp16 autocast.
-- MLX: Optimized for Apple Silicon with better memory efficiency.
+- MLX: Optimized for Apple Silicon with better memory efficiency; gradient accumulation now matches PyTorch behavior.
 - Muon LR defaults to `lr` and Adam LR to `1.5 * lr`. Adjust in config.
-- Checkpoints land in `checkpoints/pretrain/` (PyTorch) or `checkpoints/pretrain_mlx/` (MLX).
+- Checkpoints land in `checkpoints/pretrain_unified/` (PyTorch) or `checkpoints/pretrain_mlx/` (MLX).
 - Memory monitoring active - training uses ~2.1GB/18GB on M3 Pro.
 - Comprehensive logging to TensorBoard and JSON files.
 - Tested successfully on small scale (50 steps); full training (2.8B tokens) requires improved tokenizer first.
@@ -106,25 +106,25 @@ Multi-turn prompt history is kept in plain text; there are no safety filters.
 - DPO: `HuggingFaceH4/ultrafeedback_binarized` is configured; any dataset with `prompt/chosen/rejected` fields will flow.
 - Alternate pretrain corpus: `EliMC/Ultra-FineWeb` (`content` string field, `en` split). Swap into `data.dataset` and set `data.text_field: content` to leverage its filtered web crawl.
 
-### Data + tokenizer one-liners (Ultra-FineWeb-focused)
-- Stream filtered Ultra-FineWeb (score ≥ 0.8, 200k docs):  
-  `python scripts/stream_text_dataset.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --samples 200000 --score-field score --score-min 0.8 --output data/ultrafineweb_en.txt`
-- Stream until ~2.8B tokens (sharded):
-  `python scripts/stream_for_token_budget.py --dataset EliMC/Ultra-FineWeb --split en --text-field content --tokenizer data/tokenizer.model --target-tokens 2800000000 --tokens-per-shard 50000000 --score-field score --score-min 0.8 --output-dir data/ultrafineweb_full`
-- Train tokenizer (32k BPE):
-  `python scripts/train_tokenizer.py --input data/ultrafineweb_full/shard_00000.txt --vocab-size 32000 --model-prefix data/tokenizer_v2`
-- Create MLX shards (pre-tokenized for MLX training):
-  `python scripts/create_mlx_shards.py --input-dir data/ultrafineweb_full --output-dir data/mlx_shards --tokenizer data/tokenizer.model --seq-len 2048 --compression npz`
+### Unified data pipeline
+- Plan token budget + shards from the config:  
+  `python scripts/pretrain_data_pipeline.py plan --config configs/pretrain_unified.yaml --tokens-per-shard 50000000`
+- Stream Ultra-FineWeb text until target tokens:  
+  `python scripts/pretrain_data_pipeline.py stream --config configs/pretrain_unified.yaml --tokenizer data/tokenizer.model --output-dir data/raw_ultrafineweb --tokens-per-shard 50000000 --score-field score --score-min 0.8`
+- Pretokenize shards for both MPS/MLX (memmap npy pairs):  
+  `python scripts/pretrain_data_pipeline.py tokenize --input-dir data/raw_ultrafineweb --output-dir data/pretrain_shards --tokenizer data/tokenizer.model --seq-len 2048 --format npy --cleanup-text`
+- Train tokenizer (32k BPE):  
+  `python scripts/train_tokenizer.py --input data/raw_ultrafineweb/shard_00000.txt --vocab-size 32000 --model-prefix data/tokenizer_v2`
 - Pretrain (PyTorch MPS):
-  `PYTHONPATH=src python -m anarchobot.train --config configs/pretrain_ultrafineweb.yaml`
+  `PYTHONPATH=src python -m anarchobot.train --config configs/pretrain_unified.yaml`
 - Pretrain (MLX):
-  `PYTHONPATH=src python scripts/train_mlx.py --config configs/pretrain_ultrafineweb.yaml --shard-dir data/mlx_shards --format mlx`
+  `PYTHONPATH=src python scripts/train_mlx.py --config configs/pretrain_unified.yaml --shard-dir data/pretrain_shards --format npy`
 - SFT (Ultrachat):
-  `PYTHONPATH=src python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain/step_2000.pt`
+  `PYTHONPATH=src python -m anarchobot.finetune --config configs/sft.yaml --base-checkpoint checkpoints/pretrain_unified/step_2000.pt`
 - DPO (UltraFeedback):
   `PYTHONPATH=src python -m anarchobot.rlhf --config configs/rlhf.yaml --sft-checkpoint checkpoints/sft/sft_last.pt --beta 0.1`
 - Model size + token target:
-  `python scripts/model_stats.py --config configs/pretrain_ultrafineweb.yaml`
+  `python scripts/model_stats.py --config configs/pretrain_unified.yaml`
 - Performance benchmark:
   `python scripts/benchmark.py --full`
 

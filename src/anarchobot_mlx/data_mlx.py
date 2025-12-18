@@ -60,11 +60,45 @@ class StreamingShardLoader:
                 self.y_data = data["y"]
 
         self.current_pos = 0
+        
+        # Prefetching
+        self.prefetch_queue = None
+        self.prefetch_thread = None
+        self.prefetch_n = 2
+        self.stop_signal = object()
 
     def __iter__(self) -> Iterator[Tuple[mx.array, mx.array]]:
+        if self.prefetch_n > 0:
+            import queue
+            import threading
+            self.prefetch_queue = queue.Queue(maxsize=self.prefetch_n)
+            self.prefetch_thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+            self.prefetch_thread.start()
+            return self._threaded_iter()
         return self
 
-    def __next__(self) -> Tuple[mx.array, mx.array]:
+    def _prefetch_loop(self):
+        while True:
+            try:
+                batch = self._get_next_batch_impl()
+                self.prefetch_queue.put(batch)
+            except StopIteration:
+                self.prefetch_queue.put(self.stop_signal)
+                break
+            except Exception as e:
+                # In case of error, try to put it in queue or just die
+                print(f"Prefetch error: {e}")
+                self.prefetch_queue.put(self.stop_signal)
+                break
+
+    def _threaded_iter(self):
+        while True:
+            item = self.prefetch_queue.get()
+            if item is self.stop_signal:
+                return
+            yield item
+
+    def _get_next_batch_impl(self) -> Tuple[mx.array, mx.array]:
         if self.current_pos + self.batch_size > len(self.x_data):
             # Move to next shard
             self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
@@ -72,8 +106,9 @@ class StreamingShardLoader:
 
         start = self.current_pos
         end = start + self.batch_size
-
+        
         # Extract batch and convert to MLX arrays; convert memmap slice to numpy first
+        # Doing this in background thread ensures I/O and host-to-device copy happens async
         x_np = np.asarray(self.x_data[start:end])
         y_np = np.asarray(self.y_data[start:end])
         x_batch = mx.array(x_np, dtype=mx.int32)
@@ -81,6 +116,10 @@ class StreamingShardLoader:
 
         self.current_pos = end
         return x_batch, y_batch
+
+    def __next__(self) -> Tuple[mx.array, mx.array]:
+        # Fallback for non-threaded usage
+        return self._get_next_batch_impl()
 
 
 def shard_paths(shard_dir: Path, extension: str = "mlx") -> List[Path]:

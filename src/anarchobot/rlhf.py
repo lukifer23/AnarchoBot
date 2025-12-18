@@ -3,15 +3,14 @@ import math
 import signal
 import time
 from pathlib import Path
-from typing import Tuple
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
-import yaml
 
-from .config import DataConfig, ModelConfig, TrainingConfig
+from .config import load_yaml_config
 from .model import TransformerLM
+from .optim import build_muon_adam_optimizer
 from .tokenizer import SentencePieceTokenizer
 from .utils import append_log, cosine_lr, get_device, load_checkpoint, rotate_checkpoints, save_checkpoint, set_seed
 
@@ -62,29 +61,10 @@ def parse_args():
     return p.parse_args()
 
 
-def load_configs(path: Path):
-    cfg = yaml.safe_load(path.read_text())
-    model_cfg = ModelConfig(vocab_size=cfg["model"]["vocab_size"], **{k: v for k, v in cfg["model"].items() if k != "vocab_size"})
-
-    data_dict = dict(cfg["data"])
-    if data_dict.get("cache_dir"):
-        data_dict["cache_dir"] = Path(data_dict["cache_dir"])
-    data_cfg = DataConfig(**data_dict)
-
-    train_dict = dict(cfg["train"])
-    for key in ["save_dir", "tokenizer_path", "checkpoint_path", "log_path"]:
-        if train_dict.get(key):
-            train_dict[key] = Path(train_dict[key])
-    if "ckpt_keep" in train_dict and isinstance(train_dict["ckpt_keep"], str):
-        train_dict["ckpt_keep"] = int(train_dict["ckpt_keep"])
-    train_cfg = TrainingConfig(**train_dict)
-    return model_cfg, data_cfg, train_cfg
-
-
 def main():
     args = parse_args()
     beta = args.beta
-    model_cfg, data_cfg, train_cfg = load_configs(args.config)
+    model_cfg, data_cfg, train_cfg = load_yaml_config(args.config)
     set_seed(7)
     device = get_device()
     if device.type != "mps":
@@ -96,7 +76,16 @@ def main():
     if train_cfg.compile and hasattr(torch, "compile"):
         policy = torch.compile(policy)
     ref_model = TransformerLM(model_cfg).to(device)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    if train_cfg.optimizer == "muon_adam":
+        optimizer = build_muon_adam_optimizer(
+            model=policy,
+            lr_muon=train_cfg.lr,
+            lr_adam=train_cfg.lr * train_cfg.adam_lr_multiplier,
+            weight_decay=train_cfg.weight_decay,
+            momentum=0.95,
+        )
+    else:
+        optimizer = torch.optim.AdamW(policy.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
     load_checkpoint(policy, None, args.sft_checkpoint)
     ref_model.load_state_dict(policy.state_dict())
     for p in ref_model.parameters():

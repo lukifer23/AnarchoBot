@@ -8,9 +8,10 @@ import mlx.nn as nn
 
 def gradient_checkpoint(func: Callable, *args, **kwargs) -> mx.array:
     """
-    Gradient checkpointing for MLX - currently just calls the function normally.
-    MLX doesn't have built-in gradient checkpointing like PyTorch, so this is
-    a placeholder that doesn't actually save memory.
+    Gradient checkpointing for MLX.
+    Currently a no-op as MLX relies on graph compilation and lazy evaluation.
+    Physical activaton checkpointing is less critical than in eager frameworks,
+    but `mx.checkpoint` exists if needed for long sequences.
     """
     # TODO: Implement proper gradient checkpointing for MLX when available
     # For now, just call the function normally
@@ -20,12 +21,10 @@ def gradient_checkpoint(func: Callable, *args, **kwargs) -> mx.array:
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.eps = eps
-        self.weight = mx.ones((dim,))
+        self.layernorm = nn.RMSNorm(dim, eps=eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        norm = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        return self.weight * x * mx.rsqrt(norm + self.eps)
+        return self.layernorm(x)
 
 
 class RotaryEmbedding(nn.Module):
@@ -128,8 +127,7 @@ class TransformerBlock(nn.Module):
     def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
         if self.use_checkpointing:
             return gradient_checkpoint(self._forward_impl, x, mask)
-        else:
-            return self._forward_impl(x, mask)
+        return self._forward_impl(x, mask)
 
 
 class TransformerLM(nn.Module):

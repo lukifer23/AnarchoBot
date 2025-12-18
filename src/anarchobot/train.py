@@ -7,13 +7,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import yaml
 
-from .config import DataConfig, ModelConfig, TrainingConfig
+from .config import load_yaml_config
 from .data import MemmapShardDataset, TokenChunkDataset, collate_batch
 from .memory_monitor import MemoryMonitor, optimize_batch_size_for_memory
 from .model import TransformerLM
-import torch.optim as optim
+from .optim import build_muon_adam_optimizer
 from .tokenizer import SentencePieceTokenizer
 from .training_logger import TrainingLogger, TrainingMetrics, TrainingProgressTracker
 from .utils import cosine_lr, get_device, load_checkpoint, rotate_checkpoints, save_checkpoint, set_seed
@@ -24,48 +23,9 @@ def parse_args():
     parser.add_argument("--config", type=Path, required=True, help="YAML config file.")
     return parser.parse_args()
 
-
-def load_configs(path: Path):
-    cfg = yaml.safe_load(path.read_text())
-
-    # Load model config with proper type conversion
-    model_dict = dict(cfg["model"])
-    # Ensure numeric types are properly converted
-    model_numeric_fields = ["mlp_multiple", "dropout", "rope_theta", "norm_eps"]
-    for field in model_numeric_fields:
-        if field in model_dict and isinstance(model_dict[field], str):
-            model_dict[field] = float(model_dict[field])
-    model_cfg = ModelConfig(**model_dict)
-
-    # Load data config
-    data_dict = dict(cfg["data"])
-    if data_dict.get("cache_dir"):
-        data_dict["cache_dir"] = Path(data_dict["cache_dir"])
-    if data_dict.get("shard_dir"):
-        data_dict["shard_dir"] = Path(data_dict["shard_dir"])
-    data_cfg = DataConfig(**data_dict)
-
-    # Load training config
-    train_dict = dict(cfg["train"])
-    for key in ["save_dir", "tokenizer_path", "checkpoint_path", "log_path"]:
-        if train_dict.get(key):
-            train_dict[key] = Path(train_dict[key])
-
-    # Ensure numeric types are properly converted
-    train_numeric_fields = ["lr", "min_lr", "weight_decay", "max_grad_norm"]
-    for field in train_numeric_fields:
-        if field in train_dict and isinstance(train_dict[field], str):
-            train_dict[field] = float(train_dict[field])
-    if "ckpt_keep" in train_dict and isinstance(train_dict["ckpt_keep"], str):
-        train_dict["ckpt_keep"] = int(train_dict["ckpt_keep"])
-
-    train_cfg = TrainingConfig(**train_dict)
-    return model_cfg, data_cfg, train_cfg
-
-
 def main():
     args = parse_args()
-    model_cfg, data_cfg, train_cfg = load_configs(args.config)
+    model_cfg, data_cfg, train_cfg = load_yaml_config(args.config)
     set_seed(42)
 
     tokenizer = SentencePieceTokenizer(train_cfg.tokenizer_path)
@@ -93,7 +53,20 @@ def main():
     if train_cfg.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
 
-    optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    if train_cfg.optimizer == "muon_adam":
+        optimizer = build_muon_adam_optimizer(
+            model=model,
+            lr_muon=train_cfg.lr,
+            lr_adam=train_cfg.lr * train_cfg.adam_lr_multiplier,
+            weight_decay=train_cfg.weight_decay,
+            momentum=0.95,
+        )
+        print("Using Muon+Adam hybrid optimizer.")
+    else:
+        import torch.optim as torch_optim
+
+        optimizer = torch_optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+        print("Using AdamW optimizer.")
 
     start_step = 0
     if train_cfg.checkpoint_path and train_cfg.checkpoint_path.exists():
@@ -144,7 +117,7 @@ def main():
         console_log_interval=train_cfg.log_interval
     )
 
-    # Log hyperparameters (only simple types for TensorBoard compatibility)
+    tokens_per_step = train_cfg.tokens_per_step(data_cfg.seq_len)
     hyperparams = {
         "model_vocab_size": model_cfg.vocab_size,
         "model_n_layers": model_cfg.n_layers,
@@ -152,12 +125,17 @@ def main():
         "model_n_heads": model_cfg.n_heads,
         "data_dataset": data_cfg.dataset,
         "data_seq_len": data_cfg.seq_len,
+        "data_shard_dir": str(data_cfg.shard_dir) if data_cfg.shard_dir else "",
         "train_total_steps": train_cfg.total_steps,
+        "train_tokens_per_step": tokens_per_step,
+        "train_total_tokens": train_cfg.total_tokens(data_cfg.seq_len),
         "train_batch_size": train_cfg.micro_batch_size,
+        "train_grad_accum": train_cfg.grad_accum_steps,
         "train_lr": train_cfg.lr,
+        "train_optimizer": train_cfg.optimizer,
         "train_weight_decay": train_cfg.weight_decay,
         "device": str(device),
-        "torch_version": torch.__version__
+        "torch_version": torch.__version__,
     }
     logger.log_hyperparameters(hyperparams)
 
